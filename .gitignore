@@ -1,0 +1,24 @@
+# 环境变量
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# 数据和输出
+data/
+outputs/
+*.csv
+*.json
+!package.json
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+.cursor/
