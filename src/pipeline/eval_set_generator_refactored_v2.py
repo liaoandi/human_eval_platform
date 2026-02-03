@@ -126,8 +126,8 @@ SUPPORTS_STRICT_JSON_SCHEMA = True  # gpt-4o and later support this
 
 # Target Games (empty = process all)
 TARGET_GAMES = [
-    "心动小镇", "原神","三角洲行动"
-    # "大侠立志传","泰拉瑞亚","香肠派对"
+    # Add your game names here, e.g.:
+    # "game_a", "game_b", "game_c"
 ]
 
 # Default categories when LLM discovery fails
@@ -410,15 +410,15 @@ SCORE_SYSTEM_PROMPT = """
   - No: "好玩吗", "这是什么"
 
 - needs_structured_output (结构化/表格): 用户明确需要或Query最适合以表格、清单、列表、对比图的形式回答。
-  - Yes: "全角色强度排行", "五星武器属性对比表", "突破材料清单汇总"
-  - No: "怎么获得安柏"
+  - Yes: "全部内容强度排行", "装备属性对比表", "材料清单汇总"
+  - No: "怎么获得某角色"
 
 - has_heavy_constraints (复杂约束): Query包含多个限制条件、否定条件("不要")、排序要求("优先")或复合目标。
-  - Yes: "推荐个火系主C，不要五星，适合平民的", "同时满足高爆发和生存能力的配队"
-  - No: "推荐个火系角色"
+  - Yes: "推荐个A类型角色，不要高稀有度，适合新手的", "同时满足多个条件的推荐"
+  - No: "推荐个A类型角色"
 
 - is_trap_unreleased (未上线/时效陷阱): 询问未上线内容、版本更新时间、内鬼爆料、未来预测等。
-  - Yes: "5.0版本什么时候更新", "下个卡池是谁", "复刻时间表"
+  - Yes: "新版本什么时候更新", "下个活动是什么", "更新时间表"
 
 【重要规则】
 - 评分要拉开差距，对于"depth_and_value"维度，凡是简单的“什么时候上线”、“怎么删除蓝图”、“怎么改名”等问题，一律给50分以下。

@@ -3,314 +3,6 @@
 Pipeline Commons: 共用配置、函数和LLM调用器
 拆分自integrated_pipeline.py，供eval_set_generator.py和answer_collector.py共用
 """
-# --- Perplexity Cookies Utilities (fail-fast) ---
-
-import os, json, pathlib, time, logging, subprocess, sys
-from datetime import datetime
-from typing import Any, Dict, Optional, Union
-
-class PPLXCookieError(RuntimeError):
-    pass
-
-def _read_json_file(path: Union[str, pathlib.Path]) -> Any:
-    p = pathlib.Path(path)
-    if not p.exists():
-        raise PPLXCookieError(f"Cookie 文件不存在: {p}")
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise PPLXCookieError(f"Cookie 文件 JSON 解析失败: {p}, err={e}")
-
-def _normalize_cookie_obj(obj: Any) -> Any:
-    """
-    保持“原样可传给 helallao 客户端”的结构，但做最少的 sanity check：
-    - 允许 dict 或 list[dict] 两类常见导出格式
-    - 不强行改形态，直接返回；只要非空即可
-    """
-    if obj is None:
-        raise PPLXCookieError("未提供 Cookie 对象")
-    if isinstance(obj, dict):
-        if not obj:
-            raise PPLXCookieError("Cookie 字典为空")
-        return obj
-    if isinstance(obj, list):
-        if not obj:
-            raise PPLXCookieError("Cookie 列表为空")
-        # 简单校验元素形态
-        if not all(isinstance(x, dict) for x in obj):
-            raise PPLXCookieError("Cookie 列表元素必须是 dict")
-        return obj
-    raise PPLXCookieError(f"不支持的 Cookie 结构类型: {type(obj)}")
-
-
-def _prepare_cookie_for_perplexity_client(cookie_obj: Any) -> Any:
-    """
-    perplexity_async.Client 期望 cookies 为 dict/jar 形式。
-    若外部传入 list[dict]（常见于 Chrome/脚本导出格式），需要折叠为 {name: value}。
-    仅在可安全转换时才改变结构，避免泄漏敏感内容到日志。
-    """
-
-    # 某些导出格式是 {"cookies": [...]}
-    if isinstance(cookie_obj, dict):
-        inner = cookie_obj.get("cookies")
-        if isinstance(inner, list):
-            converted = _prepare_cookie_for_perplexity_client(inner)
-            if converted is not inner:
-                return converted
-        if isinstance(inner, dict):
-            simple_dict = {}
-            for key, value in inner.items():
-                if value is None:
-                    continue
-                try:
-                    simple_dict[str(key)] = str(value)
-                except Exception:
-                    continue
-            if simple_dict:
-                return simple_dict
-        return cookie_obj
-
-    if isinstance(cookie_obj, list):
-        simple_dict = {}
-        for idx, item in enumerate(cookie_obj):
-            if not isinstance(item, dict):
-                continue
-
-            name = (
-                item.get("name")
-                or item.get("Name")
-                or item.get("key")
-                or item.get("Key")
-            )
-            # value 可能为字符串或可序列化对象
-            value = item.get("value") if "value" in item else item.get("Value")
-
-            if not name or value is None:
-                continue
-
-            try:
-                # 确保最终传入字符串，避免后续 join 报错
-                simple_dict[str(name)] = str(value)
-            except Exception:
-                continue
-
-        if simple_dict:
-            return simple_dict
-
-        logging.warning("Perplexity cookies 列表格式无法转换，按原样返回，可能导致调用失败")
-
-    return cookie_obj
-
-def _load_from_env() -> Any:
-    """优先从环境变量 PERPLEXITY_COOKIES 读取（JSON 字符串）"""
-    raw = os.getenv("PERPLEXITY_COOKIES")
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        raise PPLXCookieError(f"PERPLEXITY_COOKIES 不是合法 JSON: {e}")
-
-def _load_from_path_env() -> Any:
-    """支持通过 PERPLEXITY_COOKIES_PATH 指定 JSON 文件路径"""
-    path = os.getenv("PERPLEXITY_COOKIES_PATH")
-    if not path:
-        return None
-    return _read_json_file(path)
-
-def _load_from_cache(cache_path: Union[str, pathlib.Path], max_age_hours: int) -> Any:
-    """
-    仅在明确允许的情况下使用缓存；默认不走缓存。
-    缓存文件结构示例：
-    {
-      "timestamp": 1737000000.123,  # time.time()
-      "cookies": <dict or list>
-    }
-    """
-    p = pathlib.Path(cache_path)
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        ts = float(data.get("timestamp", 0))
-        age_h = (time.time() - ts) / 3600.0
-        if age_h > max_age_hours:
-            logging.warning(f"Cookie 缓存过期（{age_h:.1f}h > {max_age_hours}h）: {p}")
-            return None
-        return data.get("cookies")
-    except Exception as e:
-        logging.warning(f"读取 Cookie 缓存失败，忽略: {p}, err={e}")
-        return None
-
-
-def _check_cookie_cache_age(cache_path: Union[str, pathlib.Path]) -> Optional[float]:
-    p = pathlib.Path(cache_path)
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        ts = data.get("timestamp")
-        if ts is None:
-            return None
-        try:
-            ts_float = float(ts)
-            age_h = (time.time() - ts_float) / 3600.0
-            return age_h
-        except (TypeError, ValueError):
-            try:
-                dt = datetime.fromisoformat(str(ts))
-                age_h = (datetime.now(dt.tzinfo) - dt).total_seconds() / 3600.0
-                return age_h
-            except Exception:
-                return None
-    except Exception:
-        return None
-
-
-def _prompt_yes_no(message: str, default: bool = False) -> bool:
-    if not sys.stdin or not sys.stdin.isatty():
-        logging.info("当前环境非交互模式，跳过输入提示，使用默认值 %s", default)
-        return default
-
-    prompt_suffix = " [Y/n]" if default else " [y/N]"
-    while True:
-        try:
-            answer = input(f"{message}{prompt_suffix} ").strip().lower()
-        except EOFError:
-            logging.info("标准输入不可用，按默认值 %s 处理", default)
-            return default
-
-        if not answer:
-            return default
-        if answer in {"y", "yes"}:
-            return True
-        if answer in {"n", "no"}:
-            return False
-        print("请输入 y 或 n")
-
-
-def _refresh_pplx_cookies(refresh_command: Optional[Union[str, list]] = None) -> bool:
-    script_dir = pathlib.Path(__file__).parent.resolve()
-
-    if refresh_command is None:
-        env_command = os.getenv("PERPLEXITY_REFRESH_COMMAND")
-        if env_command:
-            refresh_command = env_command.strip()
-
-    if refresh_command is None:
-        script_path = script_dir / "refresh_pplx_cookie_now.sh"
-        if script_path.exists():
-            refresh_command = ["/bin/bash", str(script_path)]
-        else:
-            fallback = script_dir / "perplexity_cookie_auto_full.py"
-            if fallback.exists():
-                refresh_command = [sys.executable, str(fallback)]
-            else:
-                logging.error("未找到默认的 Perplexity Cookie 刷新脚本")
-                return False
-
-    logging.info("开始执行 Perplexity Cookie 刷新命令: %s", refresh_command)
-
-    try:
-        if isinstance(refresh_command, str):
-            result = subprocess.run(refresh_command, shell=True, cwd=str(script_dir), check=False)
-        else:
-            result = subprocess.run(refresh_command, cwd=str(script_dir), check=False)
-    except Exception as exc:
-        logging.error(f"执行刷新命令失败: {exc}")
-        return False
-
-    if result.returncode == 0:
-        logging.info("Perplexity Cookie 刷新成功")
-        return True
-
-    logging.error(f"Perplexity Cookie 刷新命令返回非零状态码: {result.returncode}")
-    return False
-
-
-# Global flag to track if cookie refresh has been checked
-_PPLX_REFRESH_CHECKED = False
-
-def _maybe_prompt_refresh(cache_path: Union[str, pathlib.Path], refresh_command: Optional[Union[str, list]] = None) -> None:
-    global _PPLX_REFRESH_CHECKED
-    
-    # 如果已经检测过或者设置了跳过标志，直接返回
-    if _PPLX_REFRESH_CHECKED or os.getenv("PERPLEXITY_SKIP_REFRESH_PROMPT", "").lower() == "true":
-        return
-    
-    # 标记为已检测
-    _PPLX_REFRESH_CHECKED = True
-
-    auto_refresh = os.getenv("PERPLEXITY_AUTO_REFRESH", "").lower() == "true"
-
-    age = _check_cookie_cache_age(cache_path)
-    age_desc = f"约 {age:.1f} 小时" if age is not None else "未知"
-
-    if auto_refresh:
-        logging.info("PERPLEXITY_AUTO_REFRESH=true，自动刷新 Cookie（当前缓存年龄%s）", age_desc)
-        if not _refresh_pplx_cookies(refresh_command):
-            logging.error("自动刷新 Perplexity Cookie 失败，请手动确认")
-        return
-
-    if not sys.stdin or not sys.stdin.isatty():
-        logging.info("非交互环境，跳过 Cookie 刷新提示（当前缓存年龄%s）", age_desc)
-        return
-
-    if age is None:
-        message = "未找到 Perplexity Cookie 缓存或无法判断年龄。是否刷新?"
-    else:
-        message = f"当前 Perplexity Cookie 缓存年龄 {age_desc}。是否刷新?"
-
-    if _prompt_yes_no(message, default=False):
-        if not _refresh_pplx_cookies(refresh_command):
-            logging.error("用户确认刷新，但刷新命令执行失败。后续将继续尝试使用现有 Cookie")
-    else:
-        logging.info("用户选择不刷新 Perplexity Cookie（当前缓存年龄%s）", age_desc)
-
-def cache_pplx_cookies(cookies: Any, cache_path: Union[str, pathlib.Path]) -> None:
-    """可选：写入缓存文件（只有你明确调用时才会写）"""
-    p = pathlib.Path(cache_path)
-    payload = {"timestamp": time.time(), "cookies": cookies}
-    p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-def load_pplx_cookies(
-    *,
-    allow_cache: bool = False,
-    cache_path: Union[str, pathlib.Path] = ".perplexity_cookies_cache.json",
-    cache_max_age_hours: int = 24,
-    refresh_command: Optional[Union[str, list]] = None
-) -> Any:
-    """
-    Fail-fast 加载流程（默认不使用缓存）：
-    1) PERPLEXITY_COOKIES (env, JSON)
-    2) PERPLEXITY_COOKIES_PATH (env 指向文件)
-    3) [可选] cache_path（仅当 allow_cache=True）
-    全部失败 -> 直接抛错
-    """
-    if allow_cache:
-        _maybe_prompt_refresh(cache_path, refresh_command=refresh_command)
-
-    # 1) ENV: PERPLEXITY_COOKIES
-    obj = _load_from_env()
-    if obj is not None:
-        return _prepare_cookie_for_perplexity_client(_normalize_cookie_obj(obj))
-
-    # 2) ENV: PERPLEXITY_COOKIES_PATH
-    obj = _load_from_path_env()
-    if obj is not None:
-        return _prepare_cookie_for_perplexity_client(_normalize_cookie_obj(obj))
-
-    # 3) 可选缓存
-    if allow_cache:
-        obj = _load_from_cache(cache_path, cache_max_age_hours)
-        if obj is not None:
-            return _prepare_cookie_for_perplexity_client(_normalize_cookie_obj(obj))
-
-    # 全部失败
-    raise PPLXCookieError(
-        "未找到可用的 Perplexity Cookies；请设置 PERPLEXITY_COOKIES（JSON 字符串）或 "
-        "PERPLEXITY_COOKIES_PATH（指向 JSON 文件）。"
-    )
 
 # == 明确定义公开接口，防止不必要的导入 == #
 __all__ = [
@@ -337,10 +29,8 @@ __all__ = [
     
     # LLM调用函数
     'collect_ans_call_openai_async',
-    # 'collect_ans_call_perplexity_async',  # unused
-    # 'collect_ans_call_deepseek_async',    # unused
     'collect_ans_call_gemini_async',
-    'collect_ans_call_tapai_async', 'collect_ans_call_gpt5_async',
+    'collect_ans_call_internal_async', 'collect_ans_call_gpt5_async',
     'collect_ans_call_doubao_async', # Added new function
     
     # 初始化和设置函数
@@ -397,12 +87,12 @@ SH_SK = os.getenv("SH_ALIYUN_SK")
 
 ODPS_PROJECT = os.getenv("ODPS_PROJECT", "your_project")
 # Base table names
-SOURCE_TABLE = "dwd_ape_eval_query_collect_inc"
-_BASE_LLM_MODELS_TABLE = "dwd_ape_eval_llm_models_inc"
-_BASE_QUERY_SET_TABLE = "dwd_ape_eval_query_set_inc"
-_BASE_QUERY_PREPROCESS_DETAILS_TABLE = "dwd_ape_eval_query_preprocess_details_inc"
-_BASE_QUERY_ITEM_TABLE = "dwd_ape_eval_query_item_inc"
-_BASE_LLM_ANSWER_TABLE = "dwd_ape_eval_llm_answer_inc"
+SOURCE_TABLE = "dwd_human_eval_platform_query_collect_inc"
+_BASE_LLM_MODELS_TABLE = "dwd_human_eval_platform_llm_models_inc"
+_BASE_QUERY_SET_TABLE = "dwd_human_eval_platform_query_set_inc"
+_BASE_QUERY_PREPROCESS_DETAILS_TABLE = "dwd_human_eval_platform_query_preprocess_details_inc"
+_BASE_QUERY_ITEM_TABLE = "dwd_human_eval_platform_query_item_inc"
+_BASE_LLM_ANSWER_TABLE = "dwd_human_eval_platform_llm_answer_inc"
 
 # Default table names (formal mode)
 LLM_MODELS_TABLE_NAME = _BASE_LLM_MODELS_TABLE
@@ -458,30 +148,6 @@ MODEL_CONFIG_INTERNAL = {
 
 # External LLM configurations for answer collection
 MODEL_CONFIGS = [
-    # gpt-4o-search-preview 已弃用，使用 gpt-5 替代
-    # {
-    #     "id": 1, "model_name": "gpt-4o-search-preview", "base_model": "gpt-4o",
-    #     "model_type": "search", "provider": "OpenAI",
-    #     "params": json.dumps({
-    #         "max_tokens": COLLECT_ANS_MAX_TOKENS  # 统一使用8192 tokens，确保公平性
-    #         # temperature 参数不被支持，已在代码中过滤
-    #         # search_context_size 和 location 为公平起见已移除
-    #     }),
-    #     "api_model_name": "gpt-4o-search-preview", "column_name_suffix": "gpt-4o-search-preview",
-    #     "call_func_ref": "_collect_ans_call_openai_async"
-    # },
-    # {
-    #     "id": 6, "model_name": "gpt-5", "base_model": "gpt-5",
-    #     "model_type": "search", "provider": "OpenAI",
-    #     "params": json.dumps({
-    #         "reasoning_effort": "high",
-    #         "text_verbosity": "medium",
-    #         "max_output_tokens": COLLECT_ANS_MAX_TOKENS  # 明确设置为16384 tokens
-    #     }),
-    #     "api_model_name": "gpt-5", "column_name_suffix": "gpt-5",
-    #     "call_func_ref": "collect_ans_call_gpt5_async",
-    #     "concurrent_limit": 4  # 优化并发数到4，平衡速度和稳定性
-    # },
     {
         "id": 10, "model_name": "gpt-5-pro", "base_model": "gpt-5-pro",
         "model_type": "search", "provider": "Azure",
@@ -506,35 +172,9 @@ MODEL_CONFIGS = [
         "call_func_ref": "collect_ans_call_gpt5_async",
         "concurrent_limit": 2
     },
-    # { --cookie参数有问题
-    #     "id": 7, "model_name": "perplexity-pro-gpt5thinking", "base_model": "gpt-5-thinking",
-    #     "model_type": "search", "provider": "Perplexity",
-    #     "params": json.dumps({
-    #         "max_tokens": COLLECT_ANS_MAX_TOKENS,  # 统一使用16384 tokens，为复杂答案留出更多空间
-    #         "temperature": 0.1,
-    #         "mode": "pro",
-    #         "model": "gpt-5-thinking",  # 使用 Perplexity 新增的 gpt-5-thinking 模型
-    #         "sources": ["web"],
-    #         "language": "zh-CN"
-    #     }),
-    #     "api_model_name": "perplexity-pro-gpt5thinking", "column_name_suffix": "perplexity-pro-gpt5thinking",
-    #     "call_func_ref": "collect_ans_call_perplexity_async",
-    #     "concurrent_limit": 2  # 降低默认并发以减少空返回概率，可用 PERPLEXITY_CONCURRENT_LIMIT 覆盖
-    # },
-    # deepseek_r1 已弃用
-    # {
-    #     "id": 3, "model_name": "deepseek_r1-0528", "base_model": "deepseek_r1",
-    #     "model_type": "reasoning", "provider": "DeepSeek",
-    #     "params": json.dumps({
-    #         "max_tokens": COLLECT_ANS_MAX_TOKENS,  # 统一使用8192 tokens，确保公平性
-    #         "temperature": 0.1
-    #     }),
-    #     "api_model_name": "ep-20250531191335-jlr94", "column_name_suffix": "deepseek_r1-0528",
-    #     "call_func_ref": "_collect_ans_call_deepseek_async"
-    # },
     {
-        "id": 5, "model_name": "tap-ai", "base_model": "tap-ai",
-        "model_type": "search", "provider": "TapTap",
+        "id": 5, "model_name": "target-model", "base_model": "target-model",
+        "model_type": "search", "provider": "Internal",
         "params": json.dumps({
             "workflow": "SubQueryRAG",
             "source_type": 100,
@@ -544,25 +184,10 @@ MODEL_CONFIGS = [
             "forbidden_cache": False,
             "show_new_citation": True
         }),
-        "api_model_name": "tap-ai", "column_name_suffix": "tap-ai",
-        "call_func_ref": "collect_ans_call_tapai_async",
-        "concurrent_limit": 2  # TAP AI specific concurrent limit
+        "api_model_name": "target-model", "column_name_suffix": "target-model",
+        "call_func_ref": "collect_ans_call_internal_async",
+        "concurrent_limit": 2  # Internal model specific concurrent limit
     },
-    # {
-    #     "id": 8, "model_name": "gemini-2.5-pro", "base_model": "gemini-2.5",
-    #     "model_type": "reasoning", "provider": "Google",
-    #     "params": json.dumps({
-    #         "maxOutputTokens": 32768,  # Gemini特殊：包含thinking tokens，所以需要更大值
-    #         "temperature": 0.1,
-    #         "topP": 1.0,  # 默认为0.95，跟其他家不一样
-    #         "candidateCount": 1,
-    #         "thinkingBudget": 8192,  # 思考预算8192 tokens；可通过 GEMINI_THINKING_BUDGET 覆盖
-    #         "enable_search": True  # 启用Google搜索功能
-    #     }),
-    #     "api_model_name": "gemini-2.5-pro", "column_name_suffix": "gemini-2.5-pro",
-    #     "call_func_ref": "collect_ans_call_gemini_async",
-    #     "concurrent_limit": 2  # 下调并发以降低 500 发生概率，可用 GEMINI_CONCURRENT_LIMIT 覆盖
-    # }
     {
         "id": 12, "model_name": "gemini-3-pro-preview", "base_model": "gemini-3",
         "model_type": "reasoning", "provider": "Google",
@@ -586,7 +211,7 @@ MODEL_CONFIGS = [
              "temperature": 0.1,
              "enable_web_search": True  # Enable search
         }),
-        "api_model_name": "ep-20250619161611-qn2gg", "column_name_suffix": "doubao-seed-1.6",
+        "api_model_name": "your-doubao-endpoint", "column_name_suffix": "doubao-seed-1.6",
         "call_func_ref": "collect_ans_call_doubao_async",  # Use new dedicated function
         "concurrent_limit": 2
     },
@@ -779,19 +404,7 @@ def _extract_gemini_citations(raw_response) -> list:
     return citations
 
 
-def _extract_perplexity_citations(raw_response) -> list:
-    citations = []
-    metadata = _get_message_metadata(raw_response)
-    for result in metadata.get("web_results", []) or []:
-        if isinstance(result, dict):
-            citations.append({
-                "title": result.get("title"),
-                "url": result.get("url")
-            })
-    return citations
-
-
-def _extract_taptap_citations(raw_response) -> list:
+def _extract_internal_citations(raw_response) -> list:
     citations = []
     metadata = _get_message_metadata(raw_response)
     for citation in metadata.get("citations", []) or []:
@@ -817,8 +430,8 @@ def _extract_doubao_citations(raw_response) -> list:
 
 
 _CITATION_PROVIDER_ALIASES = {
-    "tap-ai": "taptap",
-    "tapai": "taptap",
+    "target-model": "internal",
+    "internal": "internal",
     "doubao": "doubao",
     "volcengine": "doubao",
     "bytedance": "doubao"
@@ -828,8 +441,7 @@ _CITATION_PROVIDER_ALIASES = {
 _CITATION_HANDLERS = {
     "openai": _extract_openai_citations,
     "gemini": _extract_gemini_citations,
-    "perplexity": _extract_perplexity_citations,
-    "taptap": _extract_taptap_citations,
+    "internal": _extract_internal_citations,
     "doubao": _extract_doubao_citations,
 }
 
@@ -973,8 +585,8 @@ def sanitize_name(name: str) -> str:
         A sanitized string safe for use in file paths
         
     Example:
-        >>> sanitize_name("心动小镇@#$")
-        "心动小镇___"
+        >>> sanitize_name("game_name@#$")
+        "game_name___"
     """
     return re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fff]', '_', name)
 
@@ -1046,137 +658,6 @@ async def collect_ans_call_openai_async(aclient: openai.AsyncOpenAI, query_text:
     except Exception as e:
         # Re-raise all exceptions
         raise
-
-async def collect_ans_call_perplexity_async(aclient: Any, query_text: str, model_name: str, system_prompt: str, params: dict = None) -> Any:
-    """
-    使用 helallao/perplexity-ai 的非官方实现
-    - 仅以 FINAL/FINAL_ANSWER 为准输出
-    - SEARCH_RESULTS → metadata['web_results']，供 extract_citations('perplexity', ...) 使用
-    - 严格传递 mode/model/sources/language，避免“pro 参数不生效”
-    """
-    if params is None:
-        params = {}
-
-    try:
-        import json, re, asyncio
-        import perplexity_async
-    except ImportError:
-        raise ImportError("需要安装: pip install perplexity-api-async")
-
-# 创建 Perplexity 客户端 
-    perplexity_cookies = load_pplx_cookies(
-        allow_cache=True,
-        cache_path=os.getenv("PERPLEXITY_COOKIES_CACHE", ".perplexity_cookies_cache.json")
-    )
-
-    # 2) 初始化非官方客户端
-    cli = await perplexity_async.Client(perplexity_cookies)
-
-    # 3) 组织查询：把 system_prompt 前置，最大限度贴近网页端组合提示
-    full_query = f"{system_prompt}\n\n{query_text}" if system_prompt else query_text
-
-    # 4) 关键参数——确保“pro 模式/模型/语言/来源”真的传下去
-    # helallao 的 search 支持：mode / model / sources / language / stream / incognito
-    mode = params.get("mode", "pro")  # 你强调的重点：pro
-    model = params.get("model", "gpt-5-thinking")
-    sources = params.get("sources", ["web"])
-    language = params.get("language", "zh-CN")
-    incognito = params.get("incognito", False)
-
-    # —— Debug：直接打印要发送的关键参数（你日志里能肉眼确认）——
-    logging.info(f"[PPLX helallao] mode={mode}, model={model}, sources={sources}, language={language}, incognito={incognito}")
-
-    try:
-        resp = await cli.search(
-            full_query,
-            mode=mode,
-            model=model,
-            sources=sources,
-            language=language,
-            stream=False,
-            incognito=incognito
-        )
-    finally:
-        if hasattr(cli, "close"):
-            await cli.close()
-
-    # 5) 解析 FINAL/SEARCH_RESULTS（最小化、可维护）
-    # 结构示例：resp['text'] 为步骤数组；FINAL/FINAL_ANSWER 包含最终 answer；SEARCH_RESULTS 里有 web_results
-    answer = ""
-    meta = {}
-    if isinstance(resp, dict) and isinstance(resp.get("text"), list):
-        steps = resp["text"]
-
-        # 先拿 SEARCH_RESULTS 里的 web_results
-        for it in steps:
-            if it.get("step_type") == "SEARCH_RESULTS":
-                c = it.get("content") or {}
-                if isinstance(c, dict) and isinstance(c.get("web_results"), list):
-                    meta["web_results"] = c["web_results"]
-                    meta["has_citations"] = True
-
-        # 找 FINAL / FINAL_ANSWER（找不到就取最后一个）
-        final_it = None
-        for it in steps:
-            if it.get("step_type") in ("FINAL", "FINAL_ANSWER"):
-                final_it = it
-                break
-        if not final_it and steps:
-            final_it = steps[-1]
-
-        # FINAL.content 可能是 dict/str；优先取 dict['answer']
-        content = (final_it or {}).get("content", "")
-        if isinstance(content, dict):
-            answer = content.get("answer", "") or ""
-        elif isinstance(content, str):
-            answer = content
-        else:
-            answer = str(content)
-
-    # 极端情况下兜底
-    answer = (answer or "").strip()
-    
-    # 处理JSON格式的答案和Unicode解码
-    if answer:
-        try:
-            # 检查是否是JSON格式的答案
-            if answer.startswith('{"answer":') and answer.endswith('}'):
-                import json
-                answer_data = json.loads(answer)
-                answer = answer_data.get('answer', answer)
-            
-            # 如果答案包含Unicode转义序列，解码它们
-            if '\\u' in answer:
-                answer = answer.encode().decode('unicode_escape')
-        except Exception:
-            pass
-
-    # 6) 标准化为 OpenAI 风格，供你的上层共用
-    return standardize_response(answer, metadata=meta, prompt_text=full_query)
-
-
-async def collect_ans_call_deepseek_async(aclient: openai.AsyncOpenAI, query_text: str, model_name: str, system_prompt: str, params: dict = None) -> Any:
-    # aclient for deepseek is initialized with DeepSeek's base_url
-    if params is None:
-        params = {}
-    
-    # 重新启用 system prompt
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": query_text})
-    api_params = {
-        "model": model_name,
-        "messages": messages,
-        "max_tokens": params.get("max_tokens", COLLECT_ANS_MAX_TOKENS)
-    }
-    
-    # Add DeepSeek parameters (simplified per user adjustment)
-    if "temperature" in params:
-        api_params["temperature"] = params["temperature"]
-    
-    response = await aclient.chat.completions.create(**api_params)
-    return response
 
 async def collect_ans_call_gemini_async(aclient: Any, query_text: str, model_name: str, system_prompt: str, params: dict = None) -> SimpleNamespace:
     """Handle Google Gemini calls via direct HTTP API with retry/backoff."""
@@ -1592,23 +1073,23 @@ async def collect_ans_call_doubao_async(aclient: Any, query_text: str, model_nam
         raise
 
 
-async def collect_ans_call_tapai_async(aclient: Any, query_text: str, model_name: str, system_prompt: str, params: dict = None) -> SimpleNamespace:
+async def collect_ans_call_internal_async(aclient: Any, query_text: str, model_name: str, system_prompt: str, params: dict = None) -> SimpleNamespace:
     """
-    Handles API call to TAP AI internal search assistant.
+    Handles API call to internal search assistant.
     """
-    # Check if TAP AI should be disabled
-    if os.getenv("DISABLE_TAP_AI", "false").lower() == "true":
-        disabled_msg = "TAP AI is disabled in this environment"
+    # Check if internal model should be disabled
+    if os.getenv("DISABLE_TARGET_MODEL", "false").lower() == "true":
+        disabled_msg = "Internal model is disabled in this environment"
         return standardize_response(
             disabled_msg,
             metadata={},
-            usage={"tap_metadata": {"disabled": True}},
+            usage={"internal_metadata": {"disabled": True}},
         )
-    
-    # Use longer timeout since TAP AI can be slow
-    timeout_seconds = int(os.getenv("TAP_AI_TIMEOUT", "600"))  # 默认 10 分钟，可通过环境变量调整
-    connect_timeout = int(os.getenv("TAP_AI_CONNECT_TIMEOUT", "10"))  # 连接超时默认10秒
-    logging.info(f"Calling TAP AI with {timeout_seconds}s timeout for query: {query_text[:100]}...")
+
+    # Use longer timeout since internal model can be slow
+    timeout_seconds = int(os.getenv("TARGET_MODEL_TIMEOUT", "600"))  # 默认 10 分钟，可通过环境变量调整
+    connect_timeout = int(os.getenv("TARGET_MODEL_CONNECT_TIMEOUT", "10"))  # 连接超时默认10秒
+    logging.info(f"Calling internal model with {timeout_seconds}s timeout for query: {query_text[:100]}...")
     
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout),
@@ -1618,24 +1099,24 @@ async def collect_ans_call_tapai_async(aclient: Any, query_text: str, model_name
         if params is None:
             params = {}
         
-        # Allow overriding TAP AI URL for tunnel/proxy access
-        # TAP_AI_ENV can be 'sh' (default, test environment) or 'bj' (production environment)
-        tap_ai_env = os.getenv("TAP_AI_ENV", "sh").lower()
-        if tap_ai_env == "bj":
-            default_url = "http://search-assistant.bj.internal.tapapis.com/v4/qa"
+        # Allow overriding internal model URL for tunnel/proxy access
+        # TARGET_MODEL_ENV can be 'sh' (default, test environment) or 'bj' (production environment)
+        target_model_env = os.getenv("TARGET_MODEL_ENV", "sh").lower()
+        if target_model_env == "bj":
+            default_url = "http://search-assistant.bj.internal.example.com/v4/qa"
         else:
-            default_url = "http://search-assistant.sh.internal.tapapis.com/v4/qa"
-        
-        tap_ai_url = os.getenv("TAP_AI_URL", default_url)
-        
-        url = tap_ai_url
+            default_url = "http://search-assistant.sh.internal.example.com/v4/qa"
+
+        target_model_url = os.getenv("TARGET_MODEL_URL", default_url)
+
+        url = target_model_url
         payload = {
             "workflow": params.get("workflow", "SubQueryRAG"),
             "question": query_text,
             "source_type": params.get("source_type", 100),
             "mode": params.get("mode", "2"),
             "debug": False,
-            "user_id": "452747134",
+            "user_id": "anonymous_user",
             "reasoning": params.get("reasoning", True),
             "options": {
                 "forbidden_cache": params.get("forbidden_cache", False),
@@ -1659,23 +1140,23 @@ async def collect_ans_call_tapai_async(aclient: Any, query_text: str, model_name
             response = await client.post(url, json=payload)
             response.raise_for_status()
             duration = time.monotonic() - start_time
-            logging.info(f"TAP AI responded successfully in {duration:.2f}s with status {response.status_code}")
-        
+            logging.info(f"Internal model responded successfully in {duration:.2f}s with status {response.status_code}")
+
         except httpx.TimeoutException as e:
-            error_msg = f"TAP AI request timed out after {timeout_seconds}s. Consider increasing timeout or using DISABLE_TAP_AI=true"
+            error_msg = f"Internal model request timed out after {timeout_seconds}s. Consider increasing timeout or using DISABLE_TARGET_MODEL=true"
             logging.error(error_msg)
             raise Exception(error_msg) from e
         except httpx.ConnectError as e:
-            error_msg = f"Cannot connect to TAP AI. If not on internal network, set DISABLE_TAP_AI=true"
+            error_msg = f"Cannot connect to internal model. If not on internal network, set DISABLE_TARGET_MODEL=true"
             logging.error(error_msg)
             raise Exception(error_msg) from e
         except Exception as e:
-            logging.error(f"TAP AI request failed: {e}")
+            logging.error(f"Internal model request failed: {e}")
             raise
         
         data = response.json()
         
-        # Extract answer from TAP AI response structure
+        # Extract answer from internal model response structure
         answer = data.get("answer", "")
         if not answer and data.get("data"):
             answer = data["data"].get("answer", "")
@@ -1685,7 +1166,7 @@ async def collect_ans_call_tapai_async(aclient: Any, query_text: str, model_name
         if workflow:
             metadata["workflow"] = workflow
         reasoning = data.get("reasoning")
-        # TAP AI 返回 False/None/非 bool 值都不需要写入
+        # Internal model 返回 False/None/非 bool 值都不需要写入
         if isinstance(reasoning, bool):
             if reasoning:
                 metadata["reasoning"] = reasoning
@@ -1696,12 +1177,12 @@ async def collect_ans_call_tapai_async(aclient: Any, query_text: str, model_name
         temp_response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(metadata={"citations": data.get("citations", [])}))]
         )
-        citation_data = extract_citations("taptap", temp_response)
+        citation_data = extract_citations("internal", temp_response)
         if citation_data["has_citations"]:
             metadata.update(citation_data)
 
         usage = {
-            "tap_metadata": {
+            "internal_metadata": {
                 "duration_ms": int(duration * 1000)
             }
         }
@@ -1949,12 +1430,12 @@ def sanitize_answer_text(text: Optional[str]) -> Tuple[str, Dict[str, Any]]:
           removed_plain_urls, removed_citations, removed_emoji, etc.)
     
     Example:
-        >>> text = "访问[官网](https://example.com)了解《原神》🎮[1]"
+        >>> text = "访问[官网](https://example.com)了解更多🎮[1]"
         >>> cleaned, stats = sanitize_answer_text(text)
         >>> print(cleaned)
-        访问官网了解《原神》
+        访问官网了解更多
         >>> print(stats)
-        {'removed_markdown_links': 1, 'removed_plain_urls': 0, 
+        {'removed_markdown_links': 1, 'removed_plain_urls': 0,
          'removed_citations': 1, 'removed_emoji': 1, 'raw_equals_clean': False}
     """
     if text is None:

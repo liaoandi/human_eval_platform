@@ -109,7 +109,7 @@ WITH
 		FROM eval_query_item_inc qi
 		WHERE qi.dm = MAX_PT('eval_query_item_inc')
 	),
-	tap_ai_vote_records AS (
+	target_model_vote_records AS (
 		SELECT
 			COALESCE(v.game_id, 'unknown') AS game_id,
 			COALESCE(qi.category, 'UNCLASSIFIED') AS category,
@@ -123,34 +123,34 @@ WITH
 			v.left_model_name,
 			v.right_model_name,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN 'left'
+				WHEN v.left_model_name = 'target-model' THEN 'left'
 				ELSE 'right'
-			END AS tap_position,
+			END AS target_position,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN v.answer_left
+				WHEN v.left_model_name = 'target-model' THEN v.answer_left
 				ELSE v.answer_right
-			END AS tap_answer_id,
+			END AS target_answer_id,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN v.right_model_name
+				WHEN v.left_model_name = 'target-model' THEN v.right_model_name
 				ELSE v.left_model_name
 			END AS opponent_model,
 			CASE
 				WHEN v.winner_id = 0 THEN 'draw'
 				WHEN v.winner_id = (
 					CASE
-						WHEN v.left_model_name = 'tap-ai' THEN v.answer_left
+						WHEN v.left_model_name = 'target-model' THEN v.answer_left
 						ELSE v.answer_right
 					END
 				) THEN 'win'
 				ELSE 'loss'
-			END AS tap_result
+			END AS target_result
 		FROM votes_with_models v
 		LEFT JOIN eval_queries eq
 			ON eq.eval_query_id = v.eval_query_id
 		LEFT JOIN query_items qi
 			ON qi.query_id = eq.eval_query_uuid
-		WHERE v.left_model_name = 'tap-ai'
-			OR v.right_model_name = 'tap-ai'
+		WHERE v.left_model_name = 'target-model'
+			OR v.right_model_name = 'target-model'
 	),
 	category_summary AS (
 		SELECT
@@ -159,22 +159,22 @@ WITH
 			COUNT(DISTINCT eval_query_id) AS query_count,
 			COUNT(DISTINCT comparison_id) AS comparison_count,
 			COUNT(*) AS total_votes,
-			SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS win_cnt,
-			SUM(CASE WHEN tap_result = 'loss' THEN 1 ELSE 0 END) AS loss_cnt,
-			SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) AS draw_cnt,
+			SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS win_cnt,
+			SUM(CASE WHEN target_result = 'loss' THEN 1 ELSE 0 END) AS loss_cnt,
+			SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) AS draw_cnt,
 			CASE
-				WHEN COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) > 0
+				WHEN COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) > 0
 				THEN ROUND(
-					CAST(SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
+					CAST(SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
 					/ CAST(
-						COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END)
+						COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END)
 						AS DOUBLE
 					),
 					4
 				)
 				ELSE NULL
-			END AS tap_winrate
-		FROM tap_ai_vote_records
+			END AS target_winrate
+		FROM target_model_vote_records
 		GROUP BY game_id, category
 	),
 	category_dimension_summary AS (
@@ -185,22 +185,22 @@ WITH
 			COUNT(DISTINCT eval_query_id) AS query_count,
 			COUNT(DISTINCT comparison_id) AS comparison_count,
 			COUNT(*) AS total_votes,
-			SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS win_cnt,
-			SUM(CASE WHEN tap_result = 'loss' THEN 1 ELSE 0 END) AS loss_cnt,
-			SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) AS draw_cnt,
+			SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS win_cnt,
+			SUM(CASE WHEN target_result = 'loss' THEN 1 ELSE 0 END) AS loss_cnt,
+			SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) AS draw_cnt,
 			CASE
-				WHEN COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) > 0
+				WHEN COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) > 0
 				THEN ROUND(
-					CAST(SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
+					CAST(SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
 					/ CAST(
-						COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END)
+						COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END)
 						AS DOUBLE
 					),
 					4
 				)
 				ELSE NULL
-			END AS tap_winrate
-		FROM tap_ai_vote_records
+			END AS target_winrate
+		FROM target_model_vote_records
 		GROUP BY game_id, category, eval_dim_key
 	)
 SELECT
@@ -214,7 +214,7 @@ SELECT
 	win_cnt,
 	loss_cnt,
 	draw_cnt,
-	tap_winrate
+	target_winrate
 FROM category_summary
 
 UNION ALL
@@ -230,7 +230,7 @@ SELECT
 	win_cnt,
 	loss_cnt,
 	draw_cnt,
-	tap_winrate
+	target_winrate
 FROM category_dimension_summary
 
 ORDER BY

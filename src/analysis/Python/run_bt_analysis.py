@@ -21,7 +21,7 @@ from run_bt_from_matrix import (
 )
 
 
-DEFAULT_MATRIX_PATH = "/Users/antonio/Downloads/DataWorks_数据开发_20251112161150_0.csv"
+DEFAULT_MATRIX_PATH = "/path/to/your/winrate_matrix.csv"
 REPORT_PATH_MD = Path("outputs/BT_ANALYSIS_REPORT.md")
 REPORT_PATH_CSV = Path("outputs/BT_ANALYSIS_REPORT.csv")
 

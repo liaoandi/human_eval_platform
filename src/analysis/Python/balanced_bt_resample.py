@@ -4,10 +4,10 @@ Simulate balanced game sampling (1:1:1) for Bradley-Terry rankings.
 
 Usage example:
     python balanced_bt_resample.py \
-        --matrix /Users/antonio/Downloads/DataWorks_数据开发_20251112161150_0.csv \
+        --matrix /path/to/winrate_matrix.csv \
         --output-dir outputs/balanced_bt_1to1 \
         --strategy upsample_to_max \
-        --game-ids 168332,330259,45213
+        --game-ids game_id_1,game_id_2,game_id_3
 """
 from __future__ import annotations
 
@@ -23,11 +23,11 @@ from run_bt_from_matrix import (
 )
 
 
-DEFAULT_GAME_IDS = ["168332", "330259", "45213"]  # 原神, 三角洲行动, 心动小镇
+DEFAULT_GAME_IDS = ["game_id_1", "game_id_2", "game_id_3"]  # game_a, game_b, game_c
 GAME_NAME_MAP = {
-	"168332": "原神",
-	"330259": "三角洲行动",
-	"45213": "心动小镇",
+	"game_id_1": "game_a",
+	"game_id_2": "game_b",
+	"game_id_3": "game_c",
 }
 
 
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 		"--game-ids",
 		type=str,
 		default=",".join(DEFAULT_GAME_IDS),
-		help="Comma separated game_id list to balance (default: 原神,三角洲行动,心动小镇)",
+		help="Comma separated game_id list to balance (default: game_a,game_b,game_c)",
 	)
 	parser.add_argument(
 		"--strategy",

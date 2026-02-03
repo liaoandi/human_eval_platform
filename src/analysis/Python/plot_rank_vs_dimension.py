@@ -14,7 +14,7 @@ def shorten_name(name):
     """缩短模型名称用于显示"""
     name_lower = str(name).lower()
     if 'gemini' in name_lower: return 'GEM'
-    if 'tap' in name_lower: return 'TAP'
+    if 'target' in name_lower: return 'TGT'
     if 'gpt' in name_lower: return 'GPT'
     if 'doubao' in name_lower: return 'DB'
     if 'perplexity' in name_lower or 'pplx' in name_lower: return 'PPLX'

@@ -224,7 +224,7 @@ def plot_by_game(
 		ax.axhline(0, color="#666666", linewidth=0.8, linestyle="--")
 
 	handles, labels = axes[0].get_legend_handles_labels()
-	title = fig.suptitle(f"tap-ai vs baselines - {metric_name} composition", y=0.95)
+	title = fig.suptitle(f"target-model vs baselines - {metric_name} composition", y=0.95)
 	fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 0.90))
 	plt.tight_layout(rect=(0, 0, 1, 0.85))
 	plt.savefig(output_path, dpi=200)

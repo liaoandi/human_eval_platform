@@ -62,10 +62,8 @@ from pipeline_commons import (
     
     # LLM call functions
     collect_ans_call_openai_async,
-    # collect_ans_call_perplexity_async, 
-    # collect_ans_call_deepseek_async,
     collect_ans_call_gemini_async,
-    collect_ans_call_tapai_async,
+    collect_ans_call_internal_async,
     collect_ans_call_gpt5_async,
     collect_ans_call_doubao_async,  # Added new Doubao function
     
@@ -258,8 +256,7 @@ def _get_retry_strategy(error: Exception, model_name: str, attempt: int) -> Tupl
     # Note: attempt limit is handled by the caller loop
         
     is_gpt5 = "gpt-5" in model_name.lower()
-    is_perplexity = "perplexity" in model_name.lower()
-    
+
     # Priority: respect Retry-After when present (429/5xx)
     retry_after_val = None
     if retry_after_hdr:
@@ -270,10 +267,6 @@ def _get_retry_strategy(error: Exception, model_name: str, attempt: int) -> Tupl
 
     if retry_after_val and retry_after_val > 0:
         base_delay = retry_after_val
-    elif is_perplexity:
-        base = float(os.getenv("PPLX_RETRY_BASE", str(RETRY_DELAY * 1.5)))
-        cap = float(os.getenv("PPLX_RETRY_CAP", "12.0"))
-        base_delay = min(cap, base * (2 ** attempt) * retry_delay_multiplier)
     elif is_gpt5:
         base = float(os.getenv("GPT5_RETRY_BASE", str(RETRY_DELAY * 5.0)))
         cap = float(os.getenv("GPT5_RETRY_CAP", "600.0"))
@@ -424,7 +417,6 @@ def _resolve_concurrency_limit(model_config: dict, provider: str, model_name: st
     override_specs = (
         ("LLM_CONCURRENT_LIMIT", True),
         ("GPT5_CONCURRENT_LIMIT", "gpt-5" in (model_name or "").lower()),
-        ("PERPLEXITY_CONCURRENT_LIMIT", provider == "Perplexity"),
         ("GEMINI_CONCURRENT_LIMIT", provider == "Google" or "gemini" in (model_name or "").lower()),
     )
 
@@ -633,8 +625,8 @@ async def _call_api_with_semaphore(semaphore: asyncio.Semaphore,
                     metadata["prompt_tokens"] = response.usage.prompt_tokens
                     metadata["completion_tokens"] = response.usage.completion_tokens
                     metadata["total_tokens"] = response.usage.total_tokens
-                    if hasattr(response.usage, "tap_metadata"):
-                        metadata.update(response.usage.tap_metadata)
+                    if hasattr(response.usage, "internal_metadata"):
+                        metadata.update(response.usage.internal_metadata)
                 
                 return query_id, column_suffix, "ok", sanitized_answer, _dumps_safe(metadata)
                 
@@ -727,7 +719,7 @@ async def _process_single_model_concurrent(
     model_name = model_config["model_name"]
     
     # Check if provider is available
-    if provider not in clients and provider not in ["Google", "TapTap"]:
+    if provider not in clients and provider not in ["Google", "Internal"]:
         logging.info(f"Skipping {model_name} - provider not available")
         return
     
@@ -746,7 +738,7 @@ async def _process_single_model_concurrent(
     if model_concurrent_limit != CONCURRENT_API_CALL_LIMIT:
         logging.info(f"Using custom concurrent limit for {model_name}: {model_concurrent_limit}")
 
-    client_to_pass = clients.get(provider)  # Will be None for Gemini and TapTap
+    client_to_pass = clients.get(provider)  # Will be None for Gemini and Internal
     call_func = call_func_map[model_config["call_func_ref"]]
     params_json_str = model_config.get("params", "{}")
 
@@ -762,12 +754,7 @@ async def _process_single_model_concurrent(
         return
 
     row_lookup = {getattr(row, COL_QUERY_ID): row for row in rows_ordered}
-
-    if provider == "Perplexity":
-        # Perplexity 不使用 system prompt，直接用原始 query 发挥最佳搜索能力
-        effective_prompt_template = "请用中文回答"
-    else:
-        effective_prompt_template = system_prompt_template
+    effective_prompt_template = system_prompt_template
 
     async def run_rows(rows, attempt_index):
         nonlocal remaining_limit
@@ -1027,12 +1014,10 @@ async def collect_answers_stage_concurrent(
     # Map call function references from strings to actual functions
     call_func_map = {
         "collect_ans_call_openai_async": collect_ans_call_openai_async,
-        # "collect_ans_call_perplexity_async": collect_ans_call_perplexity_async,
-        # "collect_ans_call_deepseek_async": collect_ans_call_deepseek_async,
         "collect_ans_call_gemini_async": collect_ans_call_gemini_async,
-        "collect_ans_call_tapai_async": collect_ans_call_tapai_async,
-        "collect_ans_call_gpt5_async": collect_ans_call_gpt5_async,  # GPT-5 support
-        "collect_ans_call_doubao_async": collect_ans_call_doubao_async,  # Doubao support
+        "collect_ans_call_internal_async": collect_ans_call_internal_async,
+        "collect_ans_call_gpt5_async": collect_ans_call_gpt5_async,
+        "collect_ans_call_doubao_async": collect_ans_call_doubao_async,
     }
 
     # Simplified API Key Check and Client Initialization
@@ -1053,7 +1038,7 @@ async def collect_answers_stage_concurrent(
             "key_name": "AZURE_OPENAI_API_KEY_GPT5",
             "client_init": lambda key: openai.AsyncAzureOpenAI(
                 api_key=key,
-                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_GPT5", "https://ai-aigcmistrallarge295745238327.openai.azure.com/"), 
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_GPT5", "https://your-azure-endpoint.openai.azure.com/"), 
                 api_version="2025-04-01-preview", 
                 # azure_deployment is removed to allow dynamic model selection via 'model' param in create()
                 max_retries=0,
@@ -1076,9 +1061,9 @@ async def collect_answers_stage_concurrent(
             "key_name": "GEMINI_API_KEY",
             "client_init": lambda key: None, # No client to init, handled in call func
         },
-        "TapTap": {
+        "Internal": {
             "key": "not_needed",  # Internal API, no key required
-            "key_name": "TAP_AI_INTERNAL",
+            "key_name": "TARGET_MODEL_INTERNAL",
             "client_init": lambda key: None, # No client to init, handled in call func
         }
     }
@@ -1301,14 +1286,6 @@ python answer_collector_concurrent_v2.py --auto --dm_partition 2025-08 --mode fo
 python answer_collector_concurrent_v2.py --set_id 123 --dm_partition 2025-08 --mode formal --insert
 """
 
-def _ensure_perplexity_cookie(args) -> bool:
-    """
-    Check and ensure Perplexity cookie is valid.
-    Returns True if check passed (or skipped), False if user wants to exit.
-    Perplexity support已关闭，直接返回 True。
-    """
-    return True
-
 async def main():
     """Main entry point for CONCURRENT V2 answer collector."""
     parser = argparse.ArgumentParser(description="Collect LLM answers for evaluation sets (Stage 4) - CONCURRENT V2 with all upgraded features")
@@ -1328,26 +1305,22 @@ async def main():
     overwrite_group.add_argument("--overwrite", action="store_true", help="Enable overwrite mode for ODPS tables")
     overwrite_group.add_argument("--insert", action="store_true", help="Use insert mode for ODPS tables (no overwrite)")
     
-    # TAP AI configuration via environment variables
-    parser.add_argument("--tap-ai-env", type=str, choices=["sh", "bj"], help="TAP AI environment: 'sh' for test, 'bj' for production (sets TAP_AI_ENV)")
-    parser.add_argument("--tap-ai-timeout", type=int, help="TAP AI request timeout in seconds (sets TAP_AI_TIMEOUT)")
+    # Target model configuration via environment variables
+    parser.add_argument("--target-env", type=str, choices=["sh", "bj"], help="Target model environment: 'sh' for test, 'bj' for production (sets TARGET_MODEL_ENV)")
+    parser.add_argument("--target-timeout", type=int, help="Target model request timeout in seconds (sets TARGET_MODEL_TIMEOUT)")
     
     # Retry configuration
     parser.add_argument("--no-auto-retry", action="store_true", help="Disable automatic retry of failed queries")
     parser.add_argument("--retry-mode", type=str, choices=["auto", "manual"], help="Retry mode: 'auto' for automatic retry, 'manual' to only process failed queries")
     parser.add_argument("--retry-file", type=str, help="JSON file containing failed query IDs to retry (used with --retry-mode manual)")
     
-    # Perplexity cookie management
-    parser.add_argument("--skip-cookie-check", action="store_true", help="Skip Perplexity cookie validation check at startup")
-    parser.add_argument("--auto-refresh-cookie", action="store_true", help="Automatically refresh Perplexity cookie if expired (requires perplexity_cookie_auto_full.py)")
-    
     args = parser.parse_args()
     
-    # Set TAP AI environment variables if provided
-    if args.tap_ai_env:
-        os.environ["TAP_AI_ENV"] = args.tap_ai_env
-    if args.tap_ai_timeout:
-        os.environ["TAP_AI_TIMEOUT"] = str(args.tap_ai_timeout)
+    # Set target model environment variables if provided
+    if args.target_env:
+        os.environ["TARGET_MODEL_ENV"] = args.target_env
+    if args.target_timeout:
+        os.environ["TARGET_MODEL_TIMEOUT"] = str(args.target_timeout)
     
     # Determine overwrite policy (aligned with eval_set_generator_refactored.py)
     if args.overwrite:
@@ -1372,11 +1345,7 @@ async def main():
     
     # Setup logging
     setup_logging()
-    
-    # ==== 提前检查和刷新 Perplexity Cookie ====
-    if not _ensure_perplexity_cookie(args):
-        return
-    
+
     # Initialize clients  
     general_openai_client, odps_reader, odps_writer = initialize_clients()
     

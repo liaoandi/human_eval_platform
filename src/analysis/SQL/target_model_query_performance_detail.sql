@@ -128,14 +128,14 @@ WITH
 	model_answers_pivot AS (
 		SELECT
 			eval_query_id,
-			MAX(CASE WHEN LOWER(model_name) LIKE 'tap-ai%' THEN answer_text END) AS tap_ai_answer,
+			MAX(CASE WHEN LOWER(model_name) LIKE 'target-model%' THEN answer_text END) AS target_model_answer,
 			MAX(CASE WHEN LOWER(model_name) LIKE 'gemini%' THEN answer_text END) AS gemini_answer,
 			MAX(CASE WHEN LOWER(model_name) LIKE 'gpt%' THEN answer_text END) AS gpt_answer,
 			MAX(CASE WHEN LOWER(model_name) LIKE 'perplexity%' THEN answer_text END) AS pplx_answer
 		FROM model_answers_raw
 		GROUP BY eval_query_id
 	),
-	tap_ai_vote_records AS (
+	target_model_vote_records AS (
 		SELECT
 			COALESCE(v.game_id, 'unknown') AS game_id,
 			COALESCE(qi.category, 'UNCLASSIFIED') AS category,
@@ -149,42 +149,42 @@ WITH
 			v.left_model_name,
 			v.right_model_name,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN 'left'
+				WHEN v.left_model_name = 'target-model' THEN 'left'
 				ELSE 'right'
-			END AS tap_position,
+			END AS target_position,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN v.answer_left
+				WHEN v.left_model_name = 'target-model' THEN v.answer_left
 				ELSE v.answer_right
-			END AS tap_answer_id,
+			END AS target_answer_id,
 			CASE
-				WHEN v.left_model_name = 'tap-ai' THEN v.right_model_name
+				WHEN v.left_model_name = 'target-model' THEN v.right_model_name
 				ELSE v.left_model_name
 			END AS opponent_model,
 			CASE
-				WHEN LOWER(CASE WHEN v.left_model_name = 'tap-ai' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'gemini%' THEN 'gemini'
-				WHEN LOWER(CASE WHEN v.left_model_name = 'tap-ai' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'gpt%' THEN 'gpt'
-				WHEN LOWER(CASE WHEN v.left_model_name = 'tap-ai' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'perplexity%' THEN 'pplx'
+				WHEN LOWER(CASE WHEN v.left_model_name = 'target-model' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'gemini%' THEN 'gemini'
+				WHEN LOWER(CASE WHEN v.left_model_name = 'target-model' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'gpt%' THEN 'gpt'
+				WHEN LOWER(CASE WHEN v.left_model_name = 'target-model' THEN v.right_model_name ELSE v.left_model_name END) LIKE 'perplexity%' THEN 'pplx'
 				ELSE NULL
 			END AS opponent_family,
 			CASE
 				WHEN v.winner_id = 0 THEN 'draw'
 				WHEN v.winner_id = (
 					CASE
-						WHEN v.left_model_name = 'tap-ai' THEN v.answer_left
+						WHEN v.left_model_name = 'target-model' THEN v.answer_left
 						ELSE v.answer_right
 					END
 				) THEN 'win'
 				ELSE 'loss'
-			END AS tap_result
+			END AS target_result
 		FROM votes_with_models v
 		LEFT JOIN eval_queries eq
 			ON eq.eval_query_id = v.eval_query_id
 		LEFT JOIN query_items qi
 			ON qi.query_id = eq.eval_query_uuid
-		WHERE v.left_model_name = 'tap-ai'
-			OR v.right_model_name = 'tap-ai'
+		WHERE v.left_model_name = 'target-model'
+			OR v.right_model_name = 'target-model'
 	),
-	tap_ai_query_stats AS (
+	target_model_query_stats AS (
 		SELECT
 			game_id,
 			category,
@@ -192,9 +192,9 @@ WITH
 			MAX(raw_query) AS raw_query,
 			COUNT(DISTINCT comparison_id) AS comparison_count,
 			COUNT(*) AS total_votes,
-			SUM(CASE WHEN tap_position = 'left' THEN 1 ELSE 0 END) AS tap_left_votes,
-			SUM(CASE WHEN tap_position = 'right' THEN 1 ELSE 0 END) AS tap_right_votes
-		FROM tap_ai_vote_records
+			SUM(CASE WHEN target_position = 'left' THEN 1 ELSE 0 END) AS target_left_votes,
+			SUM(CASE WHEN target_position = 'right' THEN 1 ELSE 0 END) AS target_right_votes
+		FROM target_model_vote_records
 		GROUP BY
 			game_id,
 			category,
@@ -207,18 +207,18 @@ WITH
 			eval_query_id,
 			eval_dim_key,
 			CASE
-				WHEN COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) > 0
+				WHEN COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) > 0
 				THEN ROUND(
-					CAST(SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
+					CAST(SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
 					/ CAST(
-						COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END)
+						COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END)
 						AS DOUBLE
 					),
 					4
 				)
 				ELSE NULL
 			END AS dim_winrate
-		FROM tap_ai_vote_records
+		FROM target_model_vote_records
 		GROUP BY
 			game_id,
 			category,
@@ -247,18 +247,18 @@ WITH
 			opponent_family,
 			eval_dim_key,
 			CASE
-				WHEN COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END) > 0
+				WHEN COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END) > 0
 				THEN ROUND(
-					CAST(SUM(CASE WHEN tap_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
+					CAST(SUM(CASE WHEN target_result = 'win' THEN 1 ELSE 0 END) AS DOUBLE)
 					/ CAST(
-						COUNT(*) - SUM(CASE WHEN tap_result = 'draw' THEN 1 ELSE 0 END)
+						COUNT(*) - SUM(CASE WHEN target_result = 'draw' THEN 1 ELSE 0 END)
 						AS DOUBLE
 					),
 					4
 				)
 				ELSE NULL
 			END AS dim_winrate
-		FROM tap_ai_vote_records
+		FROM target_model_vote_records
 		WHERE opponent_family IS NOT NULL
 		GROUP BY
 			game_id,
@@ -287,7 +287,7 @@ WITH
 			category,
 			eval_query_id
 	),
-	tap_ai_query_detail AS (
+	target_model_query_detail AS (
 		SELECT
 			stats.game_id,
 			stats.category,
@@ -295,9 +295,9 @@ WITH
 			stats.raw_query,
 			stats.comparison_count,
 			stats.total_votes,
-			stats.tap_left_votes,
-			stats.tap_right_votes,
-			ma.tap_ai_answer,
+			stats.target_left_votes,
+			stats.target_right_votes,
+			ma.target_model_answer,
 			ma.gemini_answer,
 			ma.gpt_answer,
 			ma.pplx_answer,
@@ -313,7 +313,7 @@ WITH
 			pivot_wr_family.wr_result_usefulness_gemini,
 			pivot_wr_family.wr_result_usefulness_gpt,
 			pivot_wr_family.wr_result_usefulness_pplx
-		FROM tap_ai_query_stats stats
+		FROM target_model_query_stats stats
 		LEFT JOIN model_answers_pivot ma
 			ON ma.eval_query_id = stats.eval_query_id
 		LEFT JOIN dimension_winrates_pivot pivot_wr
@@ -331,8 +331,8 @@ SELECT
 	eval_query_id,
 	raw_query,
 	total_votes,
-	tap_left_votes,
-	tap_right_votes,
+	target_left_votes,
+	target_right_votes,
 	wr_model_style,
 	wr_result_relevance,
 	wr_result_usefulness,
@@ -345,11 +345,11 @@ SELECT
 	wr_result_usefulness_gemini,
 	wr_result_usefulness_gpt,
 	wr_result_usefulness_pplx,
-	tap_ai_answer,
+	target_model_answer,
 	gemini_answer,
 	gpt_answer,
 	pplx_answer
-FROM tap_ai_query_detail
+FROM target_model_query_detail
 ORDER BY
 	game_id,
 	category,

@@ -307,7 +307,7 @@ def main():
 	
 	if len(sys.argv) < 2:
 		print("用法: python run_bt_from_matrix.py <csv_file>")
-		print("示例: python run_bt_from_matrix.py DataWorks_数据开发_20251111200257_0.csv")
+		print("示例: python run_bt_from_matrix.py winrate_matrix.csv")
 		sys.exit(1)
 	
 	csv_path = sys.argv[1]
