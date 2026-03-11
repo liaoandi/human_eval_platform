@@ -183,6 +183,7 @@ def build_markdown_report(
 						'total_wins': 1
 					}
 				))
+	else:
 		md_lines.append("## game × 评估维度 组合排名")
 		md_lines.append("_当前数据集中缺少对应组合，未生成结果。_")
 	
